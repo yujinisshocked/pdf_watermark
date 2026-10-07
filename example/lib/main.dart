@@ -36,13 +36,19 @@ class _HomeState extends State<Home> {
     try {
       final input = File(picked.path!);
       final bytes = await input.readAsBytes();
+      // TODO: Use your own font
+      // final fonts = await File('font_path').readAsBytes();
+
       final stamped = watermarkPdf(
         bytes,
         text: 'ASDFGHJKL12345678 - ${DateTime.now()}',
         style: WatermarkStyle.tiled,
         fontSize: 8,
         opacity: 0.12,
-        grayLevel: 0.5,
+        gray: 0.5,
+        gapX: 1,
+        gapY: 1,
+        // font: fonts // Own Font
       );
       final dir = await getApplicationDocumentsDirectory();
       final out = File('${dir.path}/watermarked.pdf');
