@@ -1,0 +1,11 @@
+name: pdf_watermark
+description: Lightweight pure-Dart PDF watermarking. No native dependencies.
+version: 0.1.0
+
+environment:
+  sdk: ^3.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
