@@ -1,4 +1,4 @@
-# Flutter PDF Watermarker
+# Dart PDF Watermarker
 
 This is a pdf watermarker. Made by Yujinisshocked.
 
@@ -17,6 +17,7 @@ import 'package:pdf_watermark/pdf_watermark.dart';
 
 final out = watermarkPdf(inputBytes, text: 'CONFIDENTIAL');
 ```
+*use style: WatermarkStyle.tiled for bricked*
 
 how to use:
 
