@@ -4,349 +4,21 @@ import 'dart:typed_data';
 import 'exceptions.dart';
 import 'pdf_parser.dart';
 import 'pdf_writer.dart';
-import 'ttf.dart';
+import 'raster.dart';
+import 'zlib.dart';
 
-/// How the watermark text is laid out on each page.
-enum WatermarkStyle {
-  /// One big diagonal word across the page.
-  diagonal,
-
-  /// Tiled brick-lay pattern covering the whole page.
-  tiled,
-}
-
-// ==================================================== BASE-14 METRICS
-
-/// Helvetica AFM advance widths for ASCII 0x20..0x7E, in 1/1000 em.
-const List<int> _helvWidths = [
-  278,
-  278,
-  355,
-  556,
-  556,
-  889,
-  667,
-  191,
-  333,
-  333,
-  389,
-  584,
-  278,
-  333,
-  278,
-  278,
-  556,
-  556,
-  556,
-  556,
-  556,
-  556,
-  556,
-  556,
-  556,
-  556,
-  278,
-  278,
-  584,
-  584,
-  584,
-  556,
-  1015,
-  667,
-  667,
-  722,
-  722,
-  667,
-  611,
-  778,
-  722,
-  278,
-  500,
-  667,
-  556,
-  833,
-  722,
-  778,
-  667,
-  778,
-  722,
-  667,
-  611,
-  722,
-  667,
-  944,
-  667,
-  667,
-  611,
-  278,
-  278,
-  278,
-  469,
-  556,
-  333,
-  556,
-  556,
-  500,
-  556,
-  556,
-  278,
-  556,
-  556,
-  222,
-  222,
-  500,
-  222,
-  833,
-  556,
-  556,
-  556,
-  556,
-  333,
-  500,
-  278,
-  556,
-  500,
-  722,
-  500,
-  500,
-  500,
-  334,
-  260,
-  334,
-  584,
-];
-
-double _helvWidth(String s, double fontSize) {
-  var total = 0;
-  for (final r in s.runes) {
-    total += (r >= 0x20 && r <= 0x7E) ? _helvWidths[r - 0x20] : 556;
-  }
-  return total * fontSize / 1000.0;
-}
-
-// ==================================================== TEXT ESCAPING
-
-String _escStr(String s) {
-  final b = StringBuffer();
-  for (final r in s.runes) {
-    if (r == 0x5C) {
-      b.write(r'\');
-    } else if (r == 0x28) {
-      b.write(r'\(');
-    } else if (r == 0x29) {
-      b.write(r'\)');
-    } else if (r >= 0x20 && r <= 0x7E) {
-      b.writeCharCode(r);
-    } else if (r >= 0xA0 && r <= 0xFF) {
-      b.write('\\${r.toRadixString(8).padLeft(3, '0')}');
-    } else {
-      b.write('?');
-    }
-  }
-  return b.toString();
-}
-
-// ==================================================== FONT STATE
-
-/// Knows how to turn a Dart string into a PDF text operand and how wide
-/// the result will be. Base-14 path uses Helvetica AFM; embedded path
-/// uses glyph IDs and the TTF's own advance widths.
-class _FontState {
-  final TtfFont? ttf;
-  final Set<int> usedGlyphs;
-  _FontState(this.ttf, this.usedGlyphs);
-
-  int _glyphFor(int cp) {
-    if (ttf == null) return 0;
-    final g = ttf!.glyphFor(cp) ?? ttf!.glyphFor(0x3F) ?? 0;
-    usedGlyphs.add(g);
-    return g;
-  }
-
-  String textOperand(String s) {
-    if (ttf == null) return '(${_escStr(s)})';
-    final b = StringBuffer('<');
-    for (final r in s.runes) {
-      b.write(_glyphFor(r).toRadixString(16).padLeft(4, '0'));
-    }
-    b.write('>');
-    return b.toString();
-  }
-
-  double textWidth(String s, double fontSize) {
-    if (ttf == null) return _helvWidth(s, fontSize);
-    var total = 0;
-    for (final r in s.runes) {
-      final g = ttf!.glyphFor(r) ?? ttf!.glyphFor(0x3F) ?? 0;
-      total += ttf!.advanceFor(g);
-    }
-    return total * fontSize / ttf!.unitsPerEm;
-  }
-}
-
-// ==================================================== CONTENT BUILDERS
-
-String _buildDiagonalContent(
-  _FontState fs,
-  String text,
-  double x0,
-  double y0,
-  double x1,
-  double y1, {
-  required double fontSize,
-  required double gray,
-}) {
-  final cx = (x0 + x1) / 2;
-  final cy = (y0 + y1) / 2;
-  const c = 0.70710678118, s = 0.70710678118;
-  final w = fs.textWidth(text, fontSize);
-  final operand = fs.textOperand(text);
-  final g = gray.toStringAsFixed(3);
-  return 'q\n'
-      '/GS_WM gs\n'
-      '$g $g $g rg\n'
-      'BT\n'
-      '/F_WM ${fontSize.toStringAsFixed(2)} Tf\n'
-      '$c $s ${-s} $c ${cx.toStringAsFixed(2)} ${cy.toStringAsFixed(2)} Tm\n'
-      '${(-w / 2).toStringAsFixed(2)} ${(-fontSize / 3).toStringAsFixed(2)} Td\n'
-      '$operand Tj\n'
-      'ET\n'
-      'Q\n';
-}
-
-String _buildTiledContent(
-  _FontState fs,
-  String text,
-  double x0,
-  double y0,
-  double x1,
-  double y1, {
-  required double fontSize,
-  required double gapX,
-  required double gapY,
-  required double gray,
-}) {
-  final w = x1 - x0;
-  final h = y1 - y0;
-  final textWidth = fs.textWidth(text, fontSize);
-  final spacingX = textWidth + gapX;
-  final spacingY = fontSize + gapY;
-  final operand = fs.textOperand(text);
-  final g = gray.toStringAsFixed(3);
-
-  final b = StringBuffer();
-  b.writeln('q');
-  b.writeln('/GS_WM gs');
-  b.writeln('$g $g $g rg');
-  b.writeln('BT');
-  b.writeln('/F_WM ${fontSize.toStringAsFixed(2)} Tf');
-
-  var row = 0;
-  for (double y = -spacingY; y < h + spacingY; y += spacingY) {
-    final offsetX = (row & 1) == 1 ? (spacingX / 2) : 0.0;
-    for (double x = -spacingX + offsetX; x < w + spacingX; x += spacingX) {
-      final fx = x0 + x;
-      final fy = y0 + y;
-      b.writeln('1 0 0 1 ${fx.toStringAsFixed(2)} ${fy.toStringAsFixed(2)} Tm');
-      b.writeln('$operand Tj');
-    }
-    row++;
-  }
-
-  b.writeln('ET');
-  b.writeln('Q');
-  return b.toString();
-}
-
-// ==================================================== BACKWARDS-COMPAT API
-
-/// Single rotated word across the rectangle. Base-14 Helvetica only.
-/// Kept for callers who use it directly; not used internally anymore.
-String buildWatermark(String text, double x0, double y0, double x1, double y1) {
-  final fs = _FontState(null, {});
-  return _buildDiagonalContent(
-    fs,
-    text,
-    x0,
-    y0,
-    x1,
-    y1,
-    fontSize: 60,
-    gray: 0.85,
-  );
-}
-
-// ==================================================== TOUNICODE CMap
-
-String _utf16Surrogates(int cp) {
-  if (cp <= 0xFFFF) return cp.toRadixString(16).padLeft(4, '0');
-  final v = cp - 0x10000;
-  final hi = 0xD800 + (v >> 10);
-  final lo = 0xDC00 + (v & 0x3FF);
-  return hi.toRadixString(16).padLeft(4, '0') +
-      lo.toRadixString(16).padLeft(4, '0');
-}
-
-String _buildToUnicode(Map<int, int> gidToCp) {
-  final b = StringBuffer();
-  b.writeln('/CIDInit /ProcSet findresource begin');
-  b.writeln('12 dict begin');
-  b.writeln('begincmap');
-  b.writeln('/CIDSystemInfo <<');
-  b.writeln('  /Registry (Adobe)');
-  b.writeln('  /Ordering (UCS)');
-  b.writeln('  /Supplement 0');
-  b.writeln('>> def');
-  b.writeln('/CMapName /Adobe-Identity-UCS def');
-  b.writeln('/CMapType 2 def');
-  b.writeln('1 begincodespacerange');
-  b.writeln('<0000> <FFFF>');
-  b.writeln('endcodespacerange');
-
-  final entries = gidToCp.entries.toList();
-  for (var i = 0; i < entries.length; i += 100) {
-    final end = (i + 100) > entries.length ? entries.length : i + 100;
-    final chunk = entries.sublist(i, end);
-    b.writeln('${chunk.length} beginbfchar');
-    for (final e in chunk) {
-      final g = e.key.toRadixString(16).padLeft(4, '0');
-      b.writeln('<$g> <${_utf16Surrogates(e.value)}>');
-    }
-    b.writeln('endbfchar');
-  }
-
-  b.writeln('endcmap');
-  b.writeln('CMapName currentdict /CMap defineresource pop');
-  b.writeln('end');
-  b.writeln('end');
-  return b.toString();
-}
-
-// ==================================================== PUBLIC API
-
-/// Watermark every page of [original] with [text].
+/// Stamps [raster] onto every page of [original] as a full-page image
+/// overlay. The raster is embedded once, so multi-page PDFs cost the
+/// same as single-page ones.
 ///
-/// If [font] is null, Helvetica (WinAnsi) is used and only Latin-1 text
-/// renders. Pass TrueType bytes for [font] to use a custom font with full
-/// Unicode support (via Identity-H CID encoding).
-///
-/// [style] selects the layout, [fontSize] is in points, [opacity] is 0..1.
+/// Output is an incremental update appended to [original]; the original
+/// bytes are never modified.
 Uint8List watermarkPdf(
   Uint8List original, {
-  required String text,
-  WatermarkStyle style = WatermarkStyle.diagonal,
-  double fontSize = 60,
-  double opacity = 0.3,
-  double gray = 0.6,
-  double gapX = 8,
-  double gapY = 6,
-  Uint8List? font,
+  required WatermarkRaster raster,
 }) {
   if (original.isEmpty) {
     throw PdfWatermarkException('empty input');
-  }
-  if (opacity < 0 || opacity > 1) {
-    throw PdfWatermarkException('opacity must be 0..1');
   }
 
   final doc = PdfDoc(original)..load();
@@ -364,61 +36,91 @@ Uint8List watermarkPdf(
 
   final pages = collectPages(doc, pagesRef.num);
   var next = doc.maxObjNum() + 1;
-
-  final ttf = font == null ? null : TtfFont.parse(font);
-
-  // Allocate object numbers up front so page dicts can reference the font
-  // before the font's contents are fully built (needs the used-glyph set).
-  final fontObjNum = next++;
-  final gsNum = next++;
-  int? fontFileNum, fontDescNum, cidFontNum, toUnicodeNum;
-  if (ttf != null) {
-    fontFileNum = next++;
-    fontDescNum = next++;
-    cidFontNum = next++;
-    toUnicodeNum = next++;
-  }
-
-  final usedGlyphs = <int>{};
-  final fs = _FontState(ttf, usedGlyphs);
   final newObjs = <int, P>{};
 
-  // ---- Pass 1: build content streams, collect used glyphs.
+  // ---- Split RGBA into RGB + alpha.
+
+  final rgba = raster.rgba;
+  final n = raster.width * raster.height;
+  final rgb = Uint8List(n * 3);
+  final alpha = Uint8List(n);
+  for (var i = 0, j = 0; i < rgba.length; i += 4, j += 3) {
+    rgb[j] = rgba[i];
+    rgb[j + 1] = rgba[i + 1];
+    rgb[j + 2] = rgba[i + 2];
+    alpha[j ~/ 3] = rgba[i + 3];
+  }
+
+  final rgbZ = deflateBytes(rgb);
+  final alphaZ = deflateBytes(alpha);
+
+  // ---- SMask (grayscale alpha channel).
+
+  final smaskNum = next++;
+  newObjs[smaskNum] = PStream(
+    PDict({
+      'Type': const PName('XObject'),
+      'Subtype': const PName('Image'),
+      'Width': PNum(raster.width),
+      'Height': PNum(raster.height),
+      'ColorSpace': const PName('DeviceGray'),
+      'BitsPerComponent': const PNum(8),
+      'Filter': const PName('FlateDecode'),
+    }),
+    alphaZ,
+  );
+
+  // ---- RGB image XObject.
+
+  final imageNum = next++;
+  newObjs[imageNum] = PStream(
+    PDict({
+      'Type': const PName('XObject'),
+      'Subtype': const PName('Image'),
+      'Width': PNum(raster.width),
+      'Height': PNum(raster.height),
+      'ColorSpace': const PName('DeviceRGB'),
+      'BitsPerComponent': const PNum(8),
+      'Filter': const PName('FlateDecode'),
+      'SMask': PRef(smaskNum, 0),
+    }),
+    rgbZ,
+  );
+
+  // ---- Reset stream: pop any leftover q/Q pairs from the original.
+
+  final resetNum = next++;
+  newObjs[resetNum] = PStream(
+    const PDict({}),
+    Uint8List.fromList(
+      // Pop up to 64 leftover graphics-state saves (fixes inherited
+      // CTM, blend modes, clip paths).
+      utf8.encode('Q\n' * 64 +
+          // Close up to 64 leftover marked-content sections (fixes
+          // OCG / transparency-group leakage where our drawing gets
+          // pulled into a layer that renders behind page content).
+          'EMC\n' * 64),
+    ),
+  );
+
+  // ---- Build per-page content streams.
 
   final contentNums = <int, int>{};
   for (final pn in pages) {
     final page = doc.obj(pn);
     if (page is! PDict) continue;
 
-    final mbRaw = inherited(doc, pn, 'MediaBox');
-    final mb = mbRaw is PArr && mbRaw.v.length >= 4
-        ? mbRaw.v.map((e) => (e as PNum).v.toDouble()).toList()
+    final boxRaw =
+        inherited(doc, pn, 'CropBox') ?? inherited(doc, pn, 'MediaBox');
+    final box = boxRaw is PArr && boxRaw.v.length >= 4
+        ? boxRaw.v.map((e) => (e as PNum).v.toDouble()).toList()
         : <double>[0, 0, 612, 792];
 
-    final stream = switch (style) {
-      WatermarkStyle.diagonal => _buildDiagonalContent(
-          fs,
-          text,
-          mb[0],
-          mb[1],
-          mb[2],
-          mb[3],
-          fontSize: fontSize,
-          gray: gray,
-        ),
-      WatermarkStyle.tiled => _buildTiledContent(
-          fs,
-          text,
-          mb[0],
-          mb[1],
-          mb[2],
-          mb[3],
-          fontSize: fontSize,
-          gapX: gapX,
-          gapY: gapY,
-          gray: gray,
-        ),
-    };
+    var rot = (inherited(doc, pn, 'Rotate') as PNum?)?.v.toInt() ?? 0;
+    rot = ((rot % 360) + 360) % 360;
+
+    final cm = _unitSquareToBox(rot, box[0], box[1], box[2], box[3]);
+    final stream = 'q\n$cm cm\n/Im_WM Do\nQ\n';
 
     final contentNum = next++;
     contentNums[pn] = contentNum;
@@ -428,94 +130,7 @@ Uint8List watermarkPdf(
     );
   }
 
-  // ---- Pass 2: build the font objects.
-
-  if (ttf == null) {
-    newObjs[fontObjNum] = PDict({
-      'Type': const PName('Font'),
-      'Subtype': const PName('Type1'),
-      'BaseFont': const PName('Helvetica'),
-      'Encoding': const PName('WinAnsiEncoding'),
-    });
-  } else {
-    final scale = 1000.0 / ttf.unitsPerEm;
-
-    // Reverse map for /ToUnicode: GID -> codepoint.
-    final reverse = <int, int>{};
-    for (final r in text.runes) {
-      final g = ttf.glyphFor(r) ?? ttf.glyphFor(0x3F);
-      if (g != null) reverse[g] = r;
-    }
-
-    newObjs[fontFileNum!] = PStream(
-      PDict({'Length1': PNum(ttf.data.length)}),
-      ttf.data,
-    );
-
-    newObjs[fontDescNum!] = PDict({
-      'Type': const PName('FontDescriptor'),
-      'FontName': PName(ttf.postScriptName),
-      'Flags': const PNum(32), // Nonsymbolic
-      'FontBBox': PArr([
-        PNum((ttf.xMin * scale).round()),
-        PNum((ttf.yMin * scale).round()),
-        PNum((ttf.xMax * scale).round()),
-        PNum((ttf.yMax * scale).round()),
-      ]),
-      'ItalicAngle': const PNum(0),
-      'Ascent': PNum((ttf.ascent * scale).round()),
-      'Descent': PNum((ttf.descent * scale).round()),
-      'CapHeight': PNum((ttf.ascent * scale * 0.7).round()),
-      'StemV': const PNum(80),
-      'FontFile2': PRef(fontFileNum, 0),
-    });
-
-    // /W array: [ gid1 [w1] gid2 [w2] ... ], widths in 1000-unit em.
-    final wArr = <P>[];
-    final gids = usedGlyphs.toList()..sort();
-    for (final g in gids) {
-      final w = (ttf.advanceFor(g) * scale).round();
-      wArr.add(PNum(g));
-      wArr.add(PArr([PNum(w)]));
-    }
-
-    newObjs[cidFontNum!] = PDict({
-      'Type': const PName('Font'),
-      'Subtype': const PName('CIDFontType2'),
-      'BaseFont': PName(ttf.postScriptName),
-      'CIDSystemInfo': PDict({
-        'Registry': PStr(Uint8List.fromList(ascii.encode('Adobe'))),
-        'Ordering': PStr(Uint8List.fromList(ascii.encode('Identity'))),
-        'Supplement': const PNum(0),
-      }),
-      'FontDescriptor': PRef(fontDescNum, 0),
-      'DW': const PNum(1000),
-      'W': PArr(wArr),
-      'CIDToGIDMap': const PName('Identity'),
-    });
-
-    newObjs[toUnicodeNum!] = PStream(
-      const PDict({}),
-      Uint8List.fromList(utf8.encode(_buildToUnicode(reverse))),
-    );
-
-    newObjs[fontObjNum] = PDict({
-      'Type': const PName('Font'),
-      'Subtype': const PName('Type0'),
-      'BaseFont': PName(ttf.postScriptName),
-      'Encoding': const PName('Identity-H'),
-      'DescendantFonts': PArr([PRef(cidFontNum, 0)]),
-      'ToUnicode': PRef(toUnicodeNum, 0),
-    });
-  }
-
-  newObjs[gsNum] = PDict({
-    'Type': const PName('ExtGState'),
-    'ca': PNum(opacity),
-    'CA': PNum(opacity),
-  });
-
-  // ---- Pass 3: rewrite page dicts.
+  // ---- Rewrite page dicts.
 
   for (final pn in pages) {
     final page = doc.obj(pn);
@@ -525,23 +140,23 @@ Uint8List watermarkPdf(
     final res = <String, P>{};
     if (resRaw is PDict) res.addAll(resRaw.v);
 
-    final fonts = <String, P>{};
-    if (res['Font'] is PDict) fonts.addAll((res['Font'] as PDict).v);
-    fonts['F_WM'] = PRef(fontObjNum, 0);
-    res['Font'] = PDict(fonts);
-
-    final gs = <String, P>{};
-    if (res['ExtGState'] is PDict) gs.addAll((res['ExtGState'] as PDict).v);
-    gs['GS_WM'] = PRef(gsNum, 0);
-    res['ExtGState'] = PDict(gs);
+    final xobjs = <String, P>{};
+    if (res['XObject'] is PDict) xobjs.addAll((res['XObject'] as PDict).v);
+    xobjs['Im_WM'] = PRef(imageNum, 0);
+    res['XObject'] = PDict(xobjs);
 
     final oldC = page.v['Contents'];
-    final contentNum = contentNums[pn]!;
-    final newC =
-        oldC == null ? PRef(contentNum, 0) : PArr([oldC, PRef(contentNum, 0)]);
+    final list = <P>[];
+    if (oldC is PArr) {
+      list.addAll(oldC.v);
+    } else if (oldC != null) {
+      list.add(oldC);
+    }
+    list.add(PRef(resetNum, 0));
+    list.add(PRef(contentNums[pn]!, 0));
 
     final newPage = Map<String, P>.from(page.v);
-    newPage['Contents'] = newC;
+    newPage['Contents'] = PArr(list);
     newPage['Resources'] = PDict(res);
     newObjs[pn] = PDict(newPage);
   }
@@ -549,7 +164,29 @@ Uint8List watermarkPdf(
   return _writeUpdate(original, doc, newObjs, next, rootRef);
 }
 
-// ==================================================== UPDATE WRITER
+// ============================================================ CM HELPERS
+
+/// CM that maps the image unit square [0,1]² to the page's visible box,
+/// compensating for /Rotate so the image appears upright to a viewer.
+String _unitSquareToBox(
+    int rotate, double x0, double y0, double x1, double y1) {
+  final w = x1 - x0;
+  final h = y1 - y0;
+  String f(double v) => v.toStringAsFixed(4);
+
+  switch (rotate) {
+    case 90:
+      return '0 ${f(h)} ${f(-w)} 0 ${f(x0 + w)} ${f(y0)}';
+    case 180:
+      return '${f(-w)} 0 0 ${f(-h)} ${f(x0 + w)} ${f(y0 + h)}';
+    case 270:
+      return '0 ${f(-h)} ${f(w)} 0 ${f(x0)} ${f(y0 + h)}';
+    default:
+      return '${f(w)} 0 0 ${f(h)} ${f(x0)} ${f(y0)}';
+  }
+}
+
+// ============================================================ WRITER
 
 Uint8List _writeUpdate(
   Uint8List orig,
@@ -593,7 +230,9 @@ Uint8List _writeUpdate(
   }
   tr['Size'] = PNum(size);
   tr['Root'] = root;
-  tr['Prev'] = PNum(doc.startXrefOffset);
+  if (doc.startXrefOffset >= 0) {
+    tr['Prev'] = PNum(doc.startXrefOffset);
+  }
 
   sb.write('trailer\n<< ');
   tr.forEach((k, v) {

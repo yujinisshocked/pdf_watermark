@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:pdf_watermark/pdf_watermark.dart';
+import 'package:pdf_watermark/flutter.dart';
 
 void main() => runApp(const App());
 
@@ -38,20 +38,28 @@ class _HomeState extends State<Home> {
       final bytes = await input.readAsBytes();
       // TODO: Use your own font
       // final fonts = await File('font_path').readAsBytes();
+      final fonts = await File(
+              '/home/yujin/Documents/projects/Flutter/pdf_watermark/example/lib/PixelOperator.ttf')
+          .readAsBytes();
 
-      final stamped = watermarkPdf(
-        bytes,
+      final size = readFirstPageSize(bytes);
+
+      final raster = await renderTiledWatermark(
         text: 'ASDFGHJKL12345678 - ${DateTime.now()}',
-        style: WatermarkStyle.tiled,
+        pageWidth: size.width,
+        pageHeight: size.height,
         fontSize: 8,
         opacity: 0.12,
-        gray: 0.5,
+        color: const Color(0xFF808080),
         gapX: 1,
         gapY: 1,
-        // font: fonts // Own Font
+        fontBytes: fonts // Own Font
       );
+
+      final stamped = watermarkPdf(bytes, raster: raster);
+
       final dir = await getApplicationDocumentsDirectory();
-      final out = File('${dir.path}/watermarked.pdf');
+      final out = File('${dir.path}/watermarked_${DateTime.now()}_${picked.name}');
       await out.writeAsBytes(stamped);
       setState(() => _status = 'Wrote ${out.path}');
     } catch (e) {

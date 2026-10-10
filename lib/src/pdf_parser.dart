@@ -410,43 +410,210 @@ class PdfDoc {
   PdfDoc(this.data);
 
   void load() {
-    startXrefOffset = _findStartXref();
-    var off = startXrefOffset;
-    final seen = <int>{};
-    while (off >= 0 && seen.add(off)) {
-      final sec = _parseXrefAt(off);
-      sec.offsets.forEach((k, v) => _offset.putIfAbsent(k, () => v));
-      sec.inStream.forEach((k, v) => _inStream.putIfAbsent(k, () => v));
-      trailer ??= sec.trailer;
-      final prev = sec.trailer?.v['Prev'];
-      off = prev is PNum ? prev.v.toInt() : -1;
+    startXrefOffset = -1;
+    try {
+      startXrefOffset = _findStartXref();
+    } catch (_) {
+      startXrefOffset = -1;
     }
+
+    var gotTrailer = false;
+
+    if (startXrefOffset >= 0) {
+      var off = startXrefOffset;
+      final seen = <int>{};
+      while (off >= 0 && seen.add(off)) {
+        _XrefSection sec;
+        try {
+          sec = _parseXrefAt(off);
+        } catch (_) {
+          break;
+        }
+        sec.offsets.forEach((k, v) => _offset.putIfAbsent(k, () => v));
+        sec.inStream.forEach((k, v) => _inStream.putIfAbsent(k, () => v));
+
+        if (sec.trailer != null) {
+          trailer ??= sec.trailer;
+          gotTrailer = true;
+        }
+
+        final xrefStm = sec.trailer?.v['XRefStm'];
+        if (xrefStm is PNum) {
+          final hOff = _offset[xrefStm.v.toInt()];
+          if (hOff != null && seen.add(hOff)) {
+            try {
+              final h = _parseXrefAt(hOff);
+              h.offsets.forEach((k, v) => _offset.putIfAbsent(k, () => v));
+              h.inStream.forEach((k, v) => _inStream.putIfAbsent(k, () => v));
+            } catch (_) {}
+          }
+        }
+
+        final prev = sec.trailer?.v['Prev'];
+        off = prev is PNum ? prev.v.toInt() : -1;
+      }
+    }
+
+    if (!gotTrailer || trailer == null) {
+      _offset.clear();
+      _inStream.clear();
+      _cache.clear();
+      _stmLoaded.clear();
+      _scanForObjects();
+      _scanForTrailer();
+      startXrefOffset = -1;
+    }
+
     if (trailer == null) {
       throw PdfWatermarkException('no PDF trailer found');
+    }
+    if (_offset.isEmpty && _inStream.isEmpty) {
+      throw PdfWatermarkException('no PDF objects found');
     }
   }
 
   int _findStartXref() {
-    final needle = ascii.encode('startxref');
-    final lo = data.length - 2048 < 0 ? 0 : data.length - 2048;
-    for (var i = data.length - needle.length; i >= lo; i--) {
-      if (_indexOf(data, needle, i) == i) {
-        var p = i + needle.length;
-        while (p < data.length && _ws(data[p])) {
-          p++;
+    const needle = 'startxref';
+    final n = data.length;
+
+    if (n < 8 ||
+        data[0] != 0x25 ||
+        data[1] != 0x50 ||
+        data[2] != 0x44 ||
+        data[3] != 0x46 ||
+        data[4] != 0x2D) {
+      throw PdfWatermarkException('not a PDF (missing %PDF- header)');
+    }
+
+    for (var i = n - needle.length; i >= 0; i--) {
+      if (data[i] != 0x73) continue;
+      var ok = true;
+      for (var j = 1; j < needle.length; j++) {
+        if (data[i + j] != needle.codeUnitAt(j)) {
+          ok = false;
+          break;
         }
-        final s = p;
-        while (p < data.length && data[p] >= 0x30 && data[p] <= 0x39) {
-          p++;
-        }
-        return int.parse(ascii.decode(data.sublist(s, p)));
       }
+      if (!ok) continue;
+
+      var p = i + needle.length;
+      while (p < n && _ws(data[p])) p++;
+      final s = p;
+      while (p < n && data[p] >= 0x30 && data[p] <= 0x39) p++;
+      if (p == s) continue;
+
+      final parsed = int.tryParse(ascii.decode(data.sublist(s, p)));
+      if (parsed == null || parsed < 0 || parsed >= n) continue;
+      return parsed;
     }
     throw PdfWatermarkException('not a PDF (no startxref)');
   }
 
+  void _scanForObjects() {
+    final n = data.length;
+    var i = 0;
+    while (i + 3 < n) {
+      if (data[i] != 0x6F ||
+          data[i + 1] != 0x62 ||
+          data[i + 2] != 0x6A ||
+          (i == 0 || !_ws(data[i - 1])) ||
+          (i + 3 < n && !_ws(data[i + 3]))) {
+        i++;
+        continue;
+      }
+
+      var j = i - 1;
+      while (j >= 0 && _ws(data[j])) j--;
+      final genEnd = j + 1;
+      while (j >= 0 && data[j] >= 0x30 && data[j] <= 0x39) j--;
+      if (j == genEnd - 1) {
+        i += 3;
+        continue;
+      }
+
+      while (j >= 0 && _ws(data[j])) j--;
+      final numEnd = j + 1;
+      while (j >= 0 && data[j] >= 0x30 && data[j] <= 0x39) j--;
+      if (j == numEnd - 1) {
+        i += 3;
+        continue;
+      }
+      final numStart = j + 1;
+
+      final num = int.tryParse(ascii.decode(data.sublist(numStart, numEnd)));
+      if (num != null && num > 0) {
+        _offset.putIfAbsent(num, () => numStart);
+      }
+      i += 3;
+    }
+  }
+
+  void _scanForTrailer() {
+    const needle = 'trailer';
+    for (var i = data.length - needle.length; i >= 0; i--) {
+      if (data[i] != 0x74) continue;
+      var ok = true;
+      for (var j = 1; j < needle.length; j++) {
+        if (data[i + j] != needle.codeUnitAt(j)) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) continue;
+      try {
+        final p = PdfParser(data, i + needle.length)..skipWs();
+        final t = p.parse();
+        if (t is PDict && t.v.containsKey('Root')) {
+          trailer = t;
+          return;
+        }
+      } catch (_) {}
+    }
+
+    for (final e in _offset.entries) {
+      try {
+        final p = PdfParser(data, e.value);
+        p.parse();
+        p.parse();
+        p.skipWs();
+        p._token();
+        final o = p.parseWithStream();
+        if (o is PStream) {
+          final t = o.dict.v['Type'];
+          if (t is PName && t.v == 'XRef' && o.dict.v.containsKey('Root')) {
+            trailer = o.dict;
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+
+    for (final e in _offset.entries) {
+      try {
+        final p = PdfParser(data, e.value);
+        p.parse();
+        p.parse();
+        p.skipWs();
+        p._token();
+        final o = p.parseWithStream();
+        if (o is PDict) {
+          final t = o.v['Type'];
+          if (t is PName && t.v == 'Catalog') {
+            trailer = PDict({
+              'Size': PNum(_offset.length + 1),
+              'Root': PRef(e.key, 0),
+            });
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
   _XrefSection _parseXrefAt(int off) {
     final sec = _XrefSection();
+    if (off < 0 || off >= data.length) return sec;
+
     final p = PdfParser(data, off);
     p.skipWs();
     if (p.p + 4 <= data.length &&
@@ -458,7 +625,9 @@ class PdfDoc {
             ascii.decode(data.sublist(p.p, p.p + 7)) == 'trailer') {
           p.p += 7;
           p.skipWs();
-          sec.trailer = p.parse() as PDict;
+          try {
+            sec.trailer = p.parse() as PDict;
+          } catch (_) {}
           break;
         }
         final a = p.parse(), b = p.parse();
@@ -467,59 +636,62 @@ class PdfDoc {
         for (var i = 0; i < count; i++) {
           p.skipWs();
           final s1 = p.p;
-          while (p.p < data.length && !_ws(data[p.p])) {
-            p.p++;
-          }
+          while (p.p < data.length && !_ws(data[p.p])) p.p++;
           final o = int.tryParse(ascii.decode(data.sublist(s1, p.p))) ?? 0;
           p.skipWs();
-          while (p.p < data.length && !_ws(data[p.p])) {
-            p.p++;
-          }
+          while (p.p < data.length && !_ws(data[p.p])) p.p++;
           p.skipWs();
           if (p.p >= data.length) break;
-          if (data[p.p++] == 0x6E /* n */) sec.offsets[start + i] = o;
+          if (data[p.p++] == 0x6E) sec.offsets[start + i] = o;
         }
       }
       return sec;
     }
 
-    // xref stream
-    final obj = p.parseWithStream();
-    if (obj is! PStream) return sec;
-    sec.trailer = obj.dict;
-    final bytes = obj.decoded();
-    final w =
-        (obj.dict.v['W'] as PArr).v.map((e) => (e as PNum).v.toInt()).toList();
-    final size = (obj.dict.v['Size'] as PNum).v.toInt();
-    final index = obj.dict.v['Index'] is PArr
-        ? (obj.dict.v['Index'] as PArr)
-            .v
-            .map((e) => (e as PNum).v.toInt())
-            .toList()
-        : [0, size];
-    final rowLen = w.fold(0, (a, b) => a + b);
-    var bp = 0;
-    for (var seg = 0; seg + 1 < index.length; seg += 2) {
-      final start = index[seg], count = index[seg + 1];
-      for (var i = 0; i < count; i++) {
-        if (bp + rowLen > bytes.length) return sec;
-        final f = <int>[];
-        for (final width in w) {
-          var v = 0;
-          for (var k = 0; k < width; k++) {
-            v = (v << 8) | bytes[bp++];
+    try {
+      p.parse();
+      p.parse();
+      p.skipWs();
+      p._token();
+      final obj = p.parseWithStream();
+      if (obj is! PStream) return sec;
+      sec.trailer = obj.dict;
+      final bytes = obj.decoded();
+      final wArr = obj.dict.v['W'];
+      if (wArr is! PArr) return sec;
+      final w = wArr.v.map((e) => (e as PNum).v.toInt()).toList();
+      final size = (obj.dict.v['Size'] as PNum?)?.v.toInt() ?? 0;
+      final index = obj.dict.v['Index'] is PArr
+          ? (obj.dict.v['Index'] as PArr)
+              .v
+              .map((e) => (e as PNum).v.toInt())
+              .toList()
+          : [0, size];
+      final rowLen = w.fold(0, (a, b) => a + b);
+      if (rowLen == 0) return sec;
+      var bp = 0;
+      for (var seg = 0; seg + 1 < index.length; seg += 2) {
+        final start = index[seg], count = index[seg + 1];
+        for (var i = 0; i < count; i++) {
+          if (bp + rowLen > bytes.length) return sec;
+          final f = <int>[];
+          for (final width in w) {
+            var v = 0;
+            for (var k = 0; k < width; k++) {
+              v = (v << 8) | bytes[bp++];
+            }
+            f.add(v);
           }
-          f.add(v);
-        }
-        final type = w[0] == 0 ? 1 : f[0];
-        final n = start + i;
-        if (type == 1) {
-          sec.offsets[n] = f[1];
-        } else if (type == 2) {
-          sec.inStream[n] = f[1];
+          final type = w[0] == 0 ? 1 : f[0];
+          final num = start + i;
+          if (type == 1) {
+            sec.offsets[num] = f[1];
+          } else if (type == 2) {
+            sec.inStream[num] = f[1];
+          }
         }
       }
-    }
+    } catch (_) {}
     return sec;
   }
 
@@ -531,7 +703,7 @@ class PdfDoc {
       p.parse();
       p.parse();
       p.skipWs();
-      p._token(); // consume 'obj'
+      p._token();
       return _cache[num] = p.parseWithStream();
     }
     final c = _inStream[num];
@@ -578,7 +750,6 @@ class PdfDoc {
     return m;
   }
 }
-
 // =================================================== PAGE NAVIGATION
 
 List<int> collectPages(PdfDoc doc, int nodeNum, [Set<int>? seen]) {
